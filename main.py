@@ -1,42 +1,53 @@
 import os
 import time
+import uuid
+import asyncio
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, HttpUrl
 from dotenv import load_dotenv
+from typing import Dict, Optional
 
-# Cargar variables de entorno (opcional)
 load_dotenv()
 
 app = FastAPI(
     title="Reel Transcriber API",
-    description="Recibe un enlace de Instagram Reel y devuelve la transcripción del audio usando AssemblyAI.",
-    version="1.0.0"
+    description="API asíncrona para transcribir Reels de Instagram usando AssemblyAI.",
+    version="2.0.0"
 )
 
-# Claves API desde variables de entorno
+# Claves API
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
 ASSEMBLYAI_KEY = os.getenv("ASSEMBLYAI_KEY", "")
 
 if not RAPIDAPI_KEY or not ASSEMBLYAI_KEY:
     print("⚠️ Advertencia: Faltan claves API. Configura RAPIDAPI_KEY y ASSEMBLYAI_KEY como variables de entorno.")
 
+# Almacenamiento de tareas en memoria
+# estructura: { task_id: {"status": "processing"|"completed"|"error", "result": str|None, "error_msg": str|None} }
+tasks: Dict[str, dict] = {}
+
+# Modelos de entrada/salida
 class ReelRequest(BaseModel):
     reel_url: HttpUrl
 
-class TranscriptionResponse(BaseModel):
-    transcription: str
-    success: bool = True
+class TaskResponse(BaseModel):
+    task_id: str
+    status: str  # "processing", "completed", "error"
+
+class TranscriptionResult(BaseModel):
+    task_id: str
+    status: str
+    transcription: Optional[str] = None
+    error: Optional[str] = None
 
 # ------------------------------------------------------------
-# 1. Obtener URL directa del video desde Instagram (RapidAPI)
+# Funciones auxiliares (sin lanzar HTTPException directamente)
 # ------------------------------------------------------------
 def download_reel_url(reel_url: str, rapid_key: str) -> str:
-    """
-    Usa la API de RapidAPI 'instagram-reels-downloader-api' para obtener la URL del video.
-    """
+    """Obtiene la URL directa del video desde RapidAPI. Lanza Exception en caso de error."""
     if not rapid_key:
-        raise HTTPException(status_code=400, detail="Falta la clave de RapidAPI. Configúrala en el servidor.")
+        raise Exception("Falta la clave de RapidAPI.")
 
     endpoint = "https://instagram-reels-downloader-api.p.rapidapi.com/download"
     params = {"url": reel_url}
@@ -50,30 +61,24 @@ def download_reel_url(reel_url: str, rapid_key: str) -> str:
         response.raise_for_status()
         data = response.json()
     except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Error al contactar RapidAPI: {str(e)}")
+        raise Exception(f"Error al contactar RapidAPI: {str(e)}")
 
-    # Validar la estructura de la respuesta (basada en el código JS original)
     medias = data.get("data", {}).get("medias")
     if not medias or not isinstance(medias, list):
-        raise HTTPException(status_code=500, detail="La respuesta de RapidAPI no contiene la lista de medios esperada.")
+        raise Exception("La respuesta de RapidAPI no contiene la lista de medios esperada.")
 
     video_item = next((item for item in medias if item.get("type") == "video"), None)
     if not video_item or not video_item.get("url"):
-        raise HTTPException(status_code=500, detail="No se encontró URL de video en la respuesta de RapidAPI.")
+        raise Exception("No se encontró URL de video en la respuesta de RapidAPI.")
 
     return video_item["url"]
 
-# ------------------------------------------------------------
-# 2. Transcribir audio/video con AssemblyAI
-# ------------------------------------------------------------
-def transcribe_audio(video_url: str, assembly_key: str) -> str:
-    """
-    Envía la URL del video a AssemblyAI, espera la transcripción y la devuelve.
-    """
-    if not assembly_key:
-        raise HTTPException(status_code=400, detail="Falta la clave de AssemblyAI. Configúrala en el servidor.")
 
-    # 1. Enviar solicitud de transcripción
+def transcribe_audio(video_url: str, assembly_key: str) -> str:
+    """Envía a AssemblyAI y espera el resultado. Lanza Exception en caso de error."""
+    if not assembly_key:
+        raise Exception("Falta la clave de AssemblyAI.")
+
     headers = {
         "Authorization": assembly_key,
         "Content-Type": "application/json"
@@ -81,11 +86,7 @@ def transcribe_audio(video_url: str, assembly_key: str) -> str:
     payload = {
         "audio_url": video_url,
         "language_detection": True,
-        "speech_models": [
-            "universal-3-pro",
-            "universal-2"
-        ]
-        # Nota: Si quieres usar modelos específicos, añade "speech_models": ["universal-3-pro", "universal-2"]
+        "speech_models": ["universal-3-pro", "universal-2"]
     }
 
     try:
@@ -98,13 +99,13 @@ def transcribe_audio(video_url: str, assembly_key: str) -> str:
         submit_resp.raise_for_status()
         transcript_id = submit_resp.json().get("id")
         if not transcript_id:
-            raise HTTPException(status_code=500, detail="AssemblyAI no devolvió un ID de transcripción.")
+            raise Exception("AssemblyAI no devolvió un ID de transcripción.")
     except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Error al enviar a AssemblyAI: {str(e)}")
+        raise Exception(f"Error al enviar a AssemblyAI: {str(e)}")
 
-    # 2. Polling hasta que esté completado (máximo 2 minutos)
+    # Polling
     poll_url = f"https://api.assemblyai.com/v2/transcript/{transcript_id}"
-    for _ in range(40):  # 40 intentos * 3s = 120 segundos
+    for _ in range(40):  # ~120 segundos
         time.sleep(3)
         try:
             poll_resp = requests.get(poll_url, headers=headers, timeout=10)
@@ -115,37 +116,84 @@ def transcribe_audio(video_url: str, assembly_key: str) -> str:
                 return data.get("text", "")
             elif status == "error":
                 error_msg = data.get("error", "Error desconocido en AssemblyAI")
-                raise HTTPException(status_code=500, detail=f"AssemblyAI error: {error_msg}")
+                raise Exception(f"AssemblyAI error: {error_msg}")
         except requests.exceptions.RequestException:
-            continue  # reintentar si falla la conexión
+            continue
 
-    raise HTTPException(status_code=504, detail="La transcripción tardó demasiado. Inténtalo de nuevo más tarde.")
+    raise Exception("La transcripción tardó demasiado. Inténtalo de nuevo más tarde.")
 
-# ------------------------------------------------------------
-# 3. Endpoint principal
-# ------------------------------------------------------------
-@app.post("/transcribe", response_model=TranscriptionResponse)
-async def transcribe_reel(request: ReelRequest):
-    """
-    Recibe la URL de un reel de Instagram y devuelve la transcripción del audio.
-    """
+
+async def process_transcription(task_id: str, reel_url: str):
+    """Función de fondo que ejecuta todo el flujo y actualiza el estado."""
     try:
-        # Paso 1: obtener URL directa del video
-        video_url = download_reel_url(str(request.reel_url), RAPIDAPI_KEY)
+        # 1. Obtener URL directa del video
+        video_url = download_reel_url(reel_url, RAPIDAPI_KEY)
 
-        # Paso 2: transcribir con AssemblyAI
+        # 2. Transcribir
         transcript = transcribe_audio(video_url, ASSEMBLYAI_KEY)
 
-        return TranscriptionResponse(transcription=transcript)
-
-    except HTTPException:
-        raise
+        # 3. Actualizar estado a completado
+        tasks[task_id]["status"] = "completed"
+        tasks[task_id]["result"] = transcript
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error interno inesperado: {str(e)}")
+        tasks[task_id]["status"] = "error"
+        tasks[task_id]["error_msg"] = str(e)
+
 
 # ------------------------------------------------------------
-# Endpoint de verificación de salud (opcional)
+# Endpoints
 # ------------------------------------------------------------
+@app.post("/transcribe", response_model=TaskResponse)
+async def start_transcription(request: ReelRequest):
+    """
+    Inicia el proceso de transcripción de un reel de Instagram.
+    Devuelve un task_id para consultar el resultado más tarde.
+    """
+    task_id = str(uuid.uuid4())
+    # Guardar estado inicial
+    tasks[task_id] = {
+        "status": "processing",
+        "result": None,
+        "error_msg": None
+    }
+    # Lanzar tarea en segundo plano (sin esperar)
+    asyncio.create_task(process_transcription(task_id, str(request.reel_url)))
+    return TaskResponse(task_id=task_id, status="processing")
+
+
+@app.get("/transcribe/{task_id}", response_model=TranscriptionResult)
+async def get_transcription(task_id: str):
+    """
+    Consulta el estado de una tarea de transcripción.
+    Si está completada, devuelve la transcripción.
+    """
+    task = tasks.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task ID no encontrado")
+
+    if task["status"] == "completed":
+        return TranscriptionResult(
+            task_id=task_id,
+            status="completed",
+            transcription=task["result"]
+        )
+    elif task["status"] == "error":
+        return TranscriptionResult(
+            task_id=task_id,
+            status="error",
+            error=task["error_msg"]
+        )
+    else:  # processing
+        return TranscriptionResult(
+            task_id=task_id,
+            status="processing"
+        )
+
+
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "rapidapi_configured": bool(RAPIDAPI_KEY), "assemblyai_configured": bool(ASSEMBLYAI_KEY)}
+    return {
+        "status": "ok",
+        "rapidapi_configured": bool(RAPIDAPI_KEY),
+        "assemblyai_configured": bool(ASSEMBLYAI_KEY)
+    }
