@@ -80,7 +80,11 @@ def transcribe_audio(video_url: str, assembly_key: str) -> str:
     }
     payload = {
         "audio_url": video_url,
-        "language_detection": True
+        "language_detection": True,
+        "speech_models": [
+            "universal-3-pro",
+            "universal-2"
+        ]
         # Nota: Si quieres usar modelos específicos, añade "speech_models": ["universal-3-pro", "universal-2"]
     }
 
