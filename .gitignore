@@ -1,0 +1,27 @@
+# Entorno virtual
+venv/
+env/
+.env
+.venv
+
+# Archivos de Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# Render / logs
+*.log
+
+# Variables de entorno y claves
+.env.local
+.env.*.local
+
+# Archivos de datos o descargas (opcional)
+downloads/
+temp/
