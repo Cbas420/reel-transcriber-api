@@ -112,56 +112,35 @@ def transcribe_audio(video_url: str, assembly_key: str) -> str:
 
 def extract_frames(video_url: str, num_frames: int = 5) -> List[str]:
     """
-    Descarga el video desde video_url, extrae 'num_frames' fotogramas
-    y devuelve una lista de strings en base64.
+    Extrae frames usando imageio (que incluye FFmpeg embebido).
     """
-    # Crear archivo temporal para el video
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_video:
-        video_path = tmp_video.name
-        # Descargar usando curl (debe estar instalado en el contenedor)
-        subprocess.run(["curl", "-s", "-o", video_path, video_url], check=True, timeout=60)
-
-    # Obtener duración del video con ffprobe
     try:
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
-            capture_output=True, text=True, check=True, timeout=30
-        )
-        duration = float(result.stdout.strip())
+        # Leer el video desde la URL
+        reader = iio.imiter(video_url, plugin="pyav")
+        
+        # Obtener la duración (no es directo, así que calculamos número total de frames)
+        # Primero, contamos los frames (esto puede ser lento, pero es una vez)
+        frames_list = list(reader)
+        total_frames = len(frames_list)
+        if total_frames == 0:
+            raise Exception("No se pudo leer el video")
+        
+        # Calcular índices de los frames a extraer
+        indices = [int(i * total_frames / (num_frames + 1)) for i in range(1, num_frames + 1)]
+        
+        frames_b64 = []
+        for idx in indices:
+            frame = frames_list[idx]
+            # Convertir frame (numpy array) a imagen PIL y luego a base64
+            pil_img = Image.fromarray(frame)
+            buffer = BytesIO()
+            pil_img.save(buffer, format="JPEG", quality=70)
+            img_b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
+            frames_b64.append(img_b64)
+        
+        return frames_b64
     except Exception as e:
-        os.unlink(video_path)
-        raise Exception(f"Error al obtener duración del video: {str(e)}")
-
-    # Calcular intervalos (evitar el primer y último segundo)
-    if duration <= 1:
-        intervals = [duration * 0.5]
-    else:
-        intervals = [i * duration / (num_frames + 1) for i in range(1, num_frames + 1)]
-
-    frames_b64 = []
-    for t in intervals:
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_frame:
-            frame_path = tmp_frame.name
-        try:
-            # Extraer frame con ffmpeg
-            subprocess.run(
-                ["ffmpeg", "-ss", str(t), "-i", video_path, "-vframes", "1",
-                 "-q:v", "2", frame_path, "-y"],
-                check=True, capture_output=True, timeout=30
-            )
-            # Leer y codificar a base64
-            with open(frame_path, "rb") as f:
-                frame_b64 = base64.b64encode(f.read()).decode("utf-8")
-            frames_b64.append(frame_b64)
-        except Exception as e:
-            print(f"Error extrayendo frame en t={t}: {e}")
-        finally:
-            if os.path.exists(frame_path):
-                os.unlink(frame_path)
-
-    os.unlink(video_path)
-    return frames_b64
+        raise Exception(f"Error extrayendo frames con imageio: {str(e)}")
 
 async def process_transcription(task_id: str, reel_url: str, include_frames: bool = True):
     try:
