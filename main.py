@@ -13,6 +13,12 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, HttpUrl
 from dotenv import load_dotenv
 from typing import Dict, Optional, Union, List
+import cv2
+import tempfile
+import os
+import base64
+import requests
+
 
 load_dotenv()
 
@@ -113,59 +119,70 @@ def transcribe_audio(video_url: str, assembly_key: str) -> str:
             continue
     raise Exception("La transcripción tardó demasiado. Inténtalo de nuevo más tarde.")
 
+
 def extract_frames(video_url: str, num_frames: int = 5) -> List[str]:
     """
-    Extrae frames usando ffmpeg directamente (subprocess).
-    Descarga el video a un archivo temporal, extrae frames y los devuelve en base64.
+    Descarga el video y extrae frames usando OpenCV (no requiere ffmpeg en el sistema).
     """
-    import tempfile, subprocess, base64, os
-
-    # Crear archivo temporal para el video
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_video:
-        video_path = tmp_video.name
-        # Descargar video con curl (mejor que requests porque maneja redirecciones)
-        subprocess.run(["curl", "-s", "-L", "-o", video_path, video_url], check=True, timeout=60)
+    # 1. Descargar el video a un archivo temporal
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_file:
+        video_path = tmp_file.name
+        # Añadir headers para evitar bloqueos
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
+        response = requests.get(video_url, headers=headers, stream=True, timeout=60)
+        response.raise_for_status()
+        for chunk in response.iter_content(chunk_size=8192):
+            tmp_file.write(chunk)
 
     try:
-        # Obtener duración del video con ffprobe
-        result = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
-            capture_output=True, text=True, check=True, timeout=30
-        )
-        duration = float(result.stdout.strip())
-    except Exception as e:
-        os.unlink(video_path)
-        raise Exception(f"Error obteniendo duración: {str(e)}")
+        # 2. Abrir video con OpenCV
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise Exception("No se pudo abrir el video con OpenCV")
 
-    # Calcular tiempos de los frames (evitando el inicio y el final)
-    if duration <= 1:
-        times = [duration * 0.5]
-    else:
-        step = duration / (num_frames + 1)
-        times = [step * i for i in range(1, num_frames + 1)]
+        # 3. Obtener duración
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        duration = total_frames / fps if fps > 0 else 0
+        if duration <= 0:
+            raise Exception("Duración del video no válida")
 
-    frames_b64 = []
-    for t in times:
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_frame:
-            frame_path = tmp_frame.name
-        try:
-            # Extraer frame con ffmpeg
-            subprocess.run(
-                ["ffmpeg", "-ss", str(t), "-i", video_path, "-vframes", "1",
-                 "-q:v", "2", frame_path, "-y"],
-                check=True, capture_output=True, timeout=30
-            )
-            # Leer archivo y codificar a base64
-            with open(frame_path, "rb") as f:
-                frame_b64 = base64.b64encode(f.read()).decode("utf-8")
-            frames_b64.append(frame_b64)
-        finally:
-            if os.path.exists(frame_path):
-                os.unlink(frame_path)
+        # 4. Calcular tiempos de los frames (evitar extremos)
+        times = []
+        if duration <= 1:
+            times = [duration * 0.5]
+        else:
+            step = duration / (num_frames + 1)
+            times = [step * i for i in range(1, num_frames + 1)]
 
-    os.unlink(video_path)
-    return frames_b64
+        frames_b64 = []
+        for t in times:
+            # Posicionar en el tiempo (milisegundos)
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ret, frame = cap.read()
+            if not ret:
+                # Intentar leer frame más cercano
+                frame_pos = int(t * fps)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
+                ret, frame = cap.read()
+            if ret and frame is not None:
+                # Convertir frame a JPEG en memoria
+                _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+                img_b64 = base64.b64encode(buffer).decode('utf-8')
+                frames_b64.append(img_b64)
+            else:
+                # Frame no disponible, agregar placeholder?
+                pass
+
+        cap.release()
+        return frames_b64
+
+    finally:
+        # Limpiar archivo temporal
+        if os.path.exists(video_path):
+            os.unlink(video_path)
 
 async def process_transcription(task_id: str, reel_url: str, include_frames: bool = True):
     try:
