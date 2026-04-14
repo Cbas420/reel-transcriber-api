@@ -119,7 +119,7 @@ def extract_frames(video_url: str, num_frames: int = 5) -> List[str]:
     """
     try:
         # Leer el video desde la URL
-        reader = iio.imiter(video_url, plugin="pyav")
+        reader = iio.imiter(video_url, plugin="ffmpeg")
         
         # Obtener la duración (no es directo, así que calculamos número total de frames)
         # Primero, contamos los frames (esto puede ser lento, pero es una vez)
