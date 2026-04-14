@@ -3,6 +3,9 @@ import time
 import uuid
 import asyncio
 import subprocess
+import imageio.v3 as iio
+from PIL import Image
+from io import BytesIO
 import tempfile
 import base64
 import requests
@@ -16,7 +19,7 @@ load_dotenv()
 app = FastAPI(title="Reel Transcriber API", version="2.0.0")
 
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY", "")
-ASSEMBLYAI_KEY = os.getenv("EMBLYAI_KEY", "")  # Corregido: ASSEMBLYAI_KEY
+ASSEMBLYAI_KEY = os.getenv("ASSEMBLYAI_KEY", "")  # Corregido: ASSEMBLYAI_KEY
 
 tasks: Dict[str, dict] = {}
 
